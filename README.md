@@ -12,6 +12,8 @@ switching pose estimation from PoseNet to Mediapipe.
   neighbour queries.
 - Manage the mirror image library by adding or removing images directly from the
   command line.
+- Mirror the original experience in real time by pairing webcam poses with the
+  closest images in the database.
 
 ## Requirements
 - Python 3.9+
@@ -35,10 +37,15 @@ python move_mirror.py add path/*.jpg  # Add new images and update the database
 python move_mirror.py delete image.jpg
 python move_mirror.py build-tree      # Rebuild the VP-tree
 python move_mirror.py match query.jpg --neighbors 3
+python move_mirror.py mirror --neighbors 3  # Run the webcam-powered mirror
 ```
 
 The script expects mirror pose images to live in `assets/images/mirror-poses`
 and optional debugging images in `assets/images/debug`.
+
+The `mirror` command streams from your default webcam (index `0`).  Ensure the
+pose database and VP-tree are populated (`add` + `build-tree`) before starting
+the session, and press `q` to exit the live window.
 
 ## Extensibility
 

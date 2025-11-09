@@ -32,11 +32,14 @@ import shutil
 import heapq
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Iterable, List, Optional, Sequence, Tuple, Union
 
 import cv2
 import mediapipe as mp
 import numpy as np
+from mediapipe.framework.formats import landmark_pb2
+from mediapipe.solutions import drawing_styles as mp_drawing_styles
+from mediapipe.solutions import drawing_utils as mp_drawing
 
 
 # ---------------------------------------------------------------------------
@@ -90,7 +93,7 @@ class PoseRecord:
 # invariant vectors similar to what posenet-similarity produced previously.
 # ---------------------------------------------------------------------------
 
-def _landmark_confidence(landmark: mp.framework.formats.landmark_pb2.NormalizedLandmark) -> float:
+def _landmark_confidence(landmark: landmark_pb2.NormalizedLandmark) -> float:
     visibility = float(getattr(landmark, "visibility", 1.0) or 0.0)
     presence = float(getattr(landmark, "presence", 1.0) or 0.0)
     visibility = max(0.0, min(visibility, 1.0))
@@ -99,7 +102,7 @@ def _landmark_confidence(landmark: mp.framework.formats.landmark_pb2.NormalizedL
 
 
 def normalize_landmarks(
-    landmarks: Sequence[mp.framework.formats.landmark_pb2.NormalizedLandmark],
+    landmarks: Sequence[landmark_pb2.NormalizedLandmark],
 ) -> Tuple[List[float], List[float]]:
     """Convert Mediapipe landmarks into normalized vectors and confidences."""
 
@@ -160,7 +163,12 @@ class PoseEstimator:
             self._pose.close()
             self._pose = None
 
-    def estimate_from_file(self, image_path: Path) -> Optional[PoseRecord]:
+    def estimate_from_file(
+        self,
+        image_path: Path,
+        *,
+        return_landmarks: bool = False,
+    ) -> Optional[Union[PoseRecord, Tuple[PoseRecord, landmark_pb2.NormalizedLandmarkList]]]:
         """Estimate a pose from the provided image file."""
 
         self._ensure_initialized()
@@ -168,9 +176,19 @@ class PoseEstimator:
         image_bgr = cv2.imread(str(image_path))
         if image_bgr is None:
             raise FileNotFoundError(f"Unable to read image: {image_path}")
-        return self.estimate_from_array(image_bgr, image_path.name)
+        return self.estimate_from_array(
+            image_bgr,
+            image_path.name,
+            return_landmarks=return_landmarks,
+        )
 
-    def estimate_from_array(self, image_bgr: np.ndarray, label: str = "frame") -> Optional[PoseRecord]:
+    def estimate_from_array(
+        self,
+        image_bgr: np.ndarray,
+        label: str = "frame",
+        *,
+        return_landmarks: bool = False,
+    ) -> Optional[Union[PoseRecord, Tuple[PoseRecord, landmark_pb2.NormalizedLandmarkList]]]:
         """Estimate a pose from an in-memory BGR image."""
 
         self._ensure_initialized()
@@ -183,7 +201,10 @@ class PoseEstimator:
         if not results.pose_landmarks:
             return None
         vector_xy, vector_confidence = normalize_landmarks(results.pose_landmarks.landmark)
-        return PoseRecord(label, vector_xy, vector_confidence)
+        record = PoseRecord(label, vector_xy, vector_confidence)
+        if return_landmarks:
+            return record, results.pose_landmarks
+        return record
 
 
 # ---------------------------------------------------------------------------
@@ -516,6 +537,156 @@ def find_nearest_matches(
 
 
 # ---------------------------------------------------------------------------
+# Real-time webcam support mirrors the original Move Mirror experience.  The
+# helper below streams frames from a webcam, draws detected skeletons, and
+# displays the closest matching mirror image from the database alongside the
+# live feed.
+# ---------------------------------------------------------------------------
+
+
+def _resize_with_aspect(image: np.ndarray, target_height: int) -> np.ndarray:
+    height, width = image.shape[:2]
+    if height <= 0 or target_height <= 0:
+        return np.zeros((max(target_height, 1), max(width, 1), 3), dtype=np.uint8)
+    scale = target_height / float(height)
+    new_width = max(1, int(round(width * scale)))
+    return cv2.resize(image, (new_width, target_height))
+
+
+def _create_match_panel(
+    best_image: Optional[np.ndarray],
+    matches: Sequence[Tuple[float, PoseRecord]],
+    frame_height: int,
+    panel_width: int = 360,
+) -> np.ndarray:
+    if best_image is not None:
+        panel = _resize_with_aspect(best_image, frame_height)
+    else:
+        panel = np.zeros((frame_height, panel_width, 3), dtype=np.uint8)
+
+    if panel.shape[1] < panel_width:
+        pad_width = panel_width - panel.shape[1]
+        panel = cv2.copyMakeBorder(panel, 0, 0, 0, pad_width, cv2.BORDER_CONSTANT, value=(0, 0, 0))
+    elif panel.shape[1] > panel_width:
+        panel = cv2.resize(panel, (panel_width, frame_height))
+
+    if matches:
+        text_lines = [
+            f"{index}. {record.image} ({distance:.3f})"
+            for index, (distance, record) in enumerate(matches, start=1)
+        ]
+        text_height = min(frame_height, 30 * len(text_lines) + 30)
+        overlay = panel.copy()
+        cv2.rectangle(overlay, (0, 0), (panel.shape[1], text_height), (0, 0, 0), -1)
+        panel = cv2.addWeighted(overlay, 0.6, panel, 0.4, 0)
+        y = 25
+        for line in text_lines:
+            cv2.putText(
+                panel,
+                line,
+                (10, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            y += 30
+
+    return panel
+
+
+def run_realtime_mirror(
+    k: int = 1,
+    camera_index: int = 0,
+    database: Optional[PoseDatabase] = None,
+    tree: Optional[VPTree] = None,
+    distance_function: Callable[[PoseRecord, PoseRecord], float] = weighted_distance,
+) -> None:
+    """Stream webcam frames and display the closest mirror pose matches."""
+
+    if database is None:
+        database = PoseDatabase()
+    if not database.records:
+        raise RuntimeError("The pose database is empty. Add images before using the mirror mode.")
+
+    if tree is None:
+        try:
+            tree = load_tree(database)
+        except FileNotFoundError:
+            tree = rebuild_vptree(database, distance_function=distance_function)
+
+    with PoseEstimator(
+        static_image_mode=False,
+        model_complexity=1,
+        enable_segmentation=False,
+        min_detection_confidence=0.5,
+    ) as estimator:
+        capture = cv2.VideoCapture(camera_index)
+        if not capture.isOpened():
+            raise RuntimeError(f"Unable to open webcam at index {camera_index}")
+
+        print("Press 'q' to quit the Move Mirror session.")
+
+        try:
+            while True:
+                success, frame = capture.read()
+                if not success or frame is None:
+                    break
+
+                estimate = estimator.estimate_from_array(frame, label="webcam", return_landmarks=True)
+                pose_record: Optional[PoseRecord] = None
+                landmarks = None
+                if estimate is not None:
+                    pose_record, landmarks = estimate
+                if pose_record is None:
+                    landmarks = None
+
+                if landmarks is not None:
+                    mp_drawing.draw_landmarks(
+                        frame,
+                        landmarks,
+                        mp.solutions.pose.POSE_CONNECTIONS,
+                        landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style(),
+                    )
+
+                matches: List[Tuple[float, PoseRecord]] = []
+                if pose_record is not None:
+                    matches = tree.search(pose_record, max(1, k))
+
+                best_image = None
+                if matches:
+                    best_path = MIRROR_IMAGE_DIR / matches[0][1].image
+                    best_image = cv2.imread(str(best_path))
+
+                panel = _create_match_panel(best_image, matches[:k], frame.shape[0])
+
+                status_text = (
+                    f"Best match: {matches[0][1].image} ({matches[0][0]:.3f})"
+                    if matches
+                    else "Pose not detected"
+                )
+                color = (0, 255, 0) if matches else (0, 0, 255)
+                cv2.putText(
+                    frame,
+                    status_text,
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.0,
+                    color,
+                    2,
+                    cv2.LINE_AA,
+                )
+
+                combined = np.hstack((frame, panel))
+                cv2.imshow("Move Mirror", combined)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+        finally:
+            capture.release()
+            cv2.destroyAllWindows()
+
+# ---------------------------------------------------------------------------
 # Command-line interface mirrors the developer tooling that previously lived in
 # the Nuxt debugging pages.  It provides list/add/delete/build/match actions.
 # ---------------------------------------------------------------------------
@@ -539,6 +710,10 @@ def _parse_arguments() -> argparse.Namespace:
     match_parser = subparsers.add_parser("match", help="Find the closest matches for an image")
     match_parser.add_argument("image", type=Path, help="Image file to evaluate")
     match_parser.add_argument("-k", "--neighbors", type=int, default=1, help="Number of matches to return")
+
+    mirror_parser = subparsers.add_parser("mirror", help="Run the real-time webcam Move Mirror")
+    mirror_parser.add_argument("-k", "--neighbors", type=int, default=1, help="Number of matches to display")
+    mirror_parser.add_argument("--camera-index", type=int, default=0, help="Webcam device index to use")
 
     return parser.parse_args()
 
@@ -581,6 +756,10 @@ def _command_match(image_path: Path, neighbors: int) -> None:
         print(f"{record.image}\t{distance:.6f}")
 
 
+def _command_mirror(neighbors: int, camera_index: int) -> None:
+    run_realtime_mirror(neighbors, camera_index)
+
+
 # ---------------------------------------------------------------------------
 # The main entry point wires the CLI commands together.  The script can be run
 # directly or imported as a module.
@@ -599,6 +778,8 @@ def main() -> None:
         _command_build_tree()
     elif args.command == "match":
         _command_match(args.image, args.neighbors)
+    elif args.command == "mirror":
+        _command_mirror(args.neighbors, args.camera_index)
 
 
 if __name__ == "__main__":
