@@ -1,69 +1,52 @@
-# move-mirror-clone
-A clone of Google Move Mirror built by Nuxt.js
+# Move Mirror (Mediapipe Edition)
 
-The implementation is based on this [blogpost](https://medium.com/tensorflow/move-mirror-an-ai-experiment-with-pose-estimation-in-the-browser-using-tensorflow-js-2f7b769f9b23).
-Recommend to have a look at it if you are interested in some background stories and technical details.
+This repository now provides a single Python script, `move_mirror.py`, that
+covers the full feature set of the original Nuxt.js Move Mirror clone while
+switching pose estimation from PoseNet to Mediapipe.
 
-## Build Setup
+## Features
+- Estimate human poses for static images using Mediapipe Pose.
+- Maintain a persistent pose database (`data/posedata.json`) compatible with the
+  original project structure.
+- Build and serialize a VP-tree (`data/prebuilt_vptree.json`) for fast nearest
+  neighbour queries.
+- Manage the mirror image library by adding or removing images directly from the
+  command line.
 
-``` bash
-# install dependencies
-$ npm install
+## Requirements
+- Python 3.9+
+- [Mediapipe](https://developers.google.com/mediapipe)
+- [OpenCV](https://opencv.org/)
+- [NumPy](https://numpy.org/)
 
-# serve with hot reload at localhost:3000
-$ npm run dev
+Install the dependencies with:
 
-# build for production and launch server
-$ npm run build
-$ npm run start
+```bash
+pip install mediapipe opencv-python numpy
 ```
 
-
 ## Usage
-The clone of Move Mirror is on [http://localhost:3000](http://localhost:3000), and you will need a webcam to play with it.
 
-Once the page is ready, the right side is your webcam video with skeleton estimated by PoseNet in realtime.
-The left side is the most similar mirror image at this moment.
+All functionality is exposed through `move_mirror.py`:
 
-> Currently the mirror image base has not well covered all possible poses yet. If you are interested in contributing images, please refer [issue #1](https://github.com/freshsomebody/move-mirror-clone/issues/1).
+```bash
+python move_mirror.py list            # List mirror images
+python move_mirror.py add path/*.jpg  # Add new images and update the database
+python move_mirror.py delete image.jpg
+python move_mirror.py build-tree      # Rebuild the VP-tree
+python move_mirror.py match query.jpg --neighbors 3
+```
 
+The script expects mirror pose images to live in `assets/images/mirror-poses`
+and optional debugging images in `assets/images/debug`.
 
-## Development
+## Extensibility
 
-### Mirror images
-Mirror images are used to match the pose in the user webcam video and are stored at **~assets/images/mirror-poses**.
+Two key functions are available for automation:
+- `expand_image_database(...)` copies new images, estimates their poses, and
+  updates the pose database.
+- `rebuild_vptree(...)` rebuilds and persists the VP-tree whenever the pose
+  database changes.
 
-> **NOTE:** You will need to rebuild the vp tree whenever you update the mirror image base. Please refer the [vp tree section](#vp-tree).
-
-### Debugging images
-Stored at **~assets/images/debug** and used for the debugging tool [http://localhost:3000/debug/matching](http://localhost:3000/debug/matching).
-
-> **NOTE:** You don't need to rebuild the vp tree when you update the debugging images.
-
-### vp tree
-To quickly retrieve the most similar mirror image, the normalized pose data of mirror images will be built into a vp tree.
-
-You can use the debugging tool [http://localhost:3000/debug/mirrorimages](http://localhost:3000/debug/mirrorimages) to build or rebuild the vp tree.
-Once a vp tree is successfully build, a pre-build file at **~api/models/prebuild-vptree.json** will be created for loading the tree.
-
-> **NOTE:** The prebuild-vptree.json must exist and be up-to-date before using Move Mirror and matching debugging tool.
-
-
-### Debugging tools
-> **NOTE:** Debugging tools can only be accessed in the development mode (npm run dev)
-
-There are 2 debugging tools:
-#### [http://localhost:3000/debug/mirrorImages](http://localhost:3000/debug/mirrorImages)
-- Draw skeletons to monitor the quality of each mirror images
-- Estimate poses of all mirror images and build vp tree
-
-#### [http://localhost:3000/debug/matching](http://localhost:3000/debug/matching)
-- Monitor the matching quality by matching the debugging images with the mirror images in vp tree
-
-### Add/ replace mirror images
-Following steps describe how you can add or replace the existing mirror images.
-1. Add/ replace images in folder **assets/images/mirror-poses**
-2. Start server in dev mode by executing `npm run dev` in your terminal
-3. Open the mirror image debugging page: [http://localhost:3000/debug/mirrorimages](http://localhost:3000/debug/mirrorimages) in the browser. You should see all your mirror images displayed here
-4. Wait for the debugging page finishing estimating all poses in mirror images
-5. Click the `Build search tree` button at the top-left corner to build the vp tree
+Both functions can be imported from `move_mirror.py` and reused in other
+applications.
